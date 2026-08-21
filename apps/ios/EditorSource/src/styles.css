@@ -13,6 +13,27 @@
   --placeholder: #94a3b8;
 }
 
+.tiptap-mathematics-render[data-type="block-math"] {
+  max-width: 100%;
+  margin: 1rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25rem 0;
+  text-align: center;
+  -webkit-overflow-scrolling: touch;
+}
+
+.inline-math-error,
+.block-math-error {
+  color: #be123c;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html[data-theme="dark"] .inline-math-error,
+html[data-theme="dark"] .block-math-error {
+  color: #fda4af;
+}
+
 html[data-theme="dark"] {
   --text: #f8fafc;
   --muted: #cbd5e1;
@@ -154,6 +175,48 @@ html[data-theme="dark"] body {
   float: left;
   height: 0;
   pointer-events: none;
+}
+
+.ProseMirror ul[data-type="taskList"] {
+  margin: 0 0 1rem;
+  padding-left: 0;
+  list-style: none;
+}
+
+.ProseMirror ul[data-type="taskList"] li[data-checked] {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 4px 0;
+}
+
+.ProseMirror ul[data-type="taskList"] li[data-checked] > label {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-top: 3px;
+  user-select: none;
+}
+
+.ProseMirror ul[data-type="taskList"] li[data-checked] > label input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: #16a06e;
+}
+
+.ProseMirror ul[data-type="taskList"] li[data-checked] > div {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.ProseMirror ul[data-type="taskList"] li[data-checked] > div > p {
+  margin-bottom: 0;
+}
+
+.ProseMirror ul[data-type="taskList"] ul[data-type="taskList"] {
+  margin: 4px 0 0;
+  padding-left: 24px;
 }
 
 .edgeever-prose img,

@@ -1,10 +1,16 @@
-import PhotosUI
+import AVFoundation
 import SwiftUI
-import UIKit
-import UniformTypeIdentifiers
+
+private enum ImagePickerRoute: String, Identifiable {
+    case camera
+    case library
+
+    var id: String { rawValue }
+}
 
 enum MemoEditMode: Equatable {
-    /// `seed` pre-fills title/body/tags (template / clip-style create). When nil, restores local new-note draft.
+    /// `seed` pre-fills title/body/tags for an explicit template, clip, or share flow.
+    /// A regular create always starts blank.
     case create(notebookId: String, seed: CreateMemoSeed? = nil)
     case edit(memoId: String)
 }
@@ -13,46 +19,64 @@ enum MemoEditMode: Equatable {
 struct MemoEditView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
 
     let mode: MemoEditMode
+    var initialSharedImages: [ShareHandoffStore.SharedImage] = []
     /// When set (edit-from-detail), close by popping to the list under the cover first —
     /// never `dismiss()` onto a still-pushed detail page.
     var onLeaveToList: (() -> Void)? = nil
     /// Create path: called with the committed memo id so the list can bounce that card.
     var onCreateFinished: ((String) -> Void)? = nil
 
-    @State private var title = ""
-    @State private var tagsText = ""
-    @State private var notebookId = ""
-    @State private var contentMarkdown = ""
-    @State private var contentJSON = "{\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\"}]}"
-    @State private var expectedRevision: Int?
-    @State private var expectedContentHash: String?
-    @State private var memoId: String?
-    @State private var error: String?
-    @State private var saveTask: Task<Void, Never>?
-    @State private var isMaterializing = false
-    @State private var isDirty = false
-    @State private var isSaving = false
-    @State private var isCreating = false
-    @State private var isUploading = false
-    @State private var editorReady = false
+    @State private var viewModel = MemoEditViewModel()
     /// True after Back/Done commit starts — blocks late TipTap `change` from rewriting the
     /// `new` draft so the next create opens empty instead of the previous note body.
-    @State private var suppressPersistence = false
     /// False until `loadInitial` has filled title/body from mirror — prevents TipTap boot
     /// with empty defaults from overwriting a non-empty note via autosave / flush.
-    @State private var contentHydrated = false
     /// Snapshot of body when edit opened (or last intentional load). Used to reject empty clobbers.
-    @State private var baselineMarkdown = ""
     @State private var showNotebookPicker = false
-    @State private var showImagePicker = false
+    @State private var showTagPicker = false
+    @State private var showImageSourcePicker = false
+    @State private var imagePickerRoute: ImagePickerRoute?
+    @State private var showCameraAccessAlert = false
+    @State private var cameraAccessCanOpenSettings = false
+    @State private var cameraAccessMessage = ""
     @State private var showUploadError = false
     @State private var showTemplatePicker = false
     @State private var showApplyTemplateConfirm = false
     @State private var pendingTemplateSeed: CreateMemoSeed?
     @State private var resourceTarget: ResourceTarget?
-    private let emptyDocJSON = "{\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\"}]}"
+    @State private var aiSelection: AiEditorSelection?
+    @State private var showEmptyAiSelectionAlert = false
+    @State private var aiUndoToken: UUID?
+    @State private var didImportSharedImages = false
+    @State private var isSuggestingTags = false
+    @State private var smartTagsAdded = false
+    @State private var showSmartTagAlert = false
+    @State private var smartTagAlertTitle = ""
+    @State private var smartTagAlertMessage = ""
+    @State private var smartTagTask: Task<Void, Never>?
+
+    private var title: String { get { viewModel.title } nonmutating set { viewModel.title = newValue } }
+    private var tagsText: String { get { viewModel.tagsText } nonmutating set { viewModel.tagsText = newValue } }
+    private var notebookId: String { get { viewModel.notebookId } nonmutating set { viewModel.notebookId = newValue } }
+    private var contentMarkdown: String { get { viewModel.contentMarkdown } nonmutating set { viewModel.contentMarkdown = newValue } }
+    private var contentJSON: String { get { viewModel.contentJSON } nonmutating set { viewModel.contentJSON = newValue } }
+    private var expectedRevision: Int? { get { viewModel.expectedRevision } nonmutating set { viewModel.expectedRevision = newValue } }
+    private var expectedContentHash: String? { get { viewModel.expectedContentHash } nonmutating set { viewModel.expectedContentHash = newValue } }
+    private var memoId: String? { get { viewModel.memoId } nonmutating set { viewModel.memoId = newValue } }
+    private var error: String? { get { viewModel.error } nonmutating set { viewModel.error = newValue } }
+    private var editGeneration: UInt64 { get { viewModel.editGeneration } nonmutating set { viewModel.editGeneration = newValue } }
+    private var isMaterializing: Bool { get { viewModel.isMaterializing } nonmutating set { viewModel.isMaterializing = newValue } }
+    private var isDirty: Bool { get { viewModel.isDirty } nonmutating set { viewModel.isDirty = newValue } }
+    private var isSaving: Bool { get { viewModel.isSaving } nonmutating set { viewModel.isSaving = newValue } }
+    private var isCreating: Bool { get { viewModel.isCreating } nonmutating set { viewModel.isCreating = newValue } }
+    private var isUploading: Bool { get { viewModel.isUploading } nonmutating set { viewModel.isUploading = newValue } }
+    private var editorReady: Bool { get { viewModel.editorReady } nonmutating set { viewModel.editorReady = newValue } }
+    private var suppressPersistence: Bool { get { viewModel.suppressPersistence } nonmutating set { viewModel.suppressPersistence = newValue } }
+    private var contentHydrated: Bool { get { viewModel.contentHydrated } nonmutating set { viewModel.contentHydrated = newValue } }
+    private var baselineMarkdown: String { get { viewModel.baselineMarkdown } nonmutating set { viewModel.baselineMarkdown = newValue } }
 
     var body: some View {
         ZStack {
@@ -80,8 +104,42 @@ struct MemoEditView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .accessibilityIdentifier("createMemoUploadOverlay")
             }
+
+            if aiUndoToken != nil {
+                VStack {
+                    Spacer()
+                    HStack(spacing: 12) {
+                        Text(env.preferences.t("AI 已更新选中内容。", en: "AI updated the selection."))
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white)
+                        Spacer(minLength: 0)
+                        Button(env.preferences.t("撤销", en: "Undo")) {
+                            Task {
+                                guard await SharedTipTapRuntime.editor.undoAiSelectionDraft() else {
+                                    aiUndoToken = nil
+                                    return
+                                }
+                                await pullEditorSnapshotIfPossible()
+                                markDirtyAndScheduleSave()
+                                aiUndoToken = nil
+                            }
+                        }
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(Color(red: 0.43, green: 0.91, blue: 0.72))
+                    }
+                    .padding(.horizontal, 14)
+                    .frame(minHeight: 48)
+                    .background(Color(red: 0.06, green: 0.09, blue: 0.16))
+                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .shadow(color: .black.opacity(0.22), radius: 14, y: 6)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 12)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .allowsHitTesting(true)
+            }
         }
-        .background(Color.white.ignoresSafeArea())
+        .background(AppTheme.card.ignoresSafeArea())
         .accessibilityIdentifier(CreateMemoChrome.root)
         .sheet(isPresented: $showNotebookPicker) {
             EditNotebookPickerSheet(
@@ -94,10 +152,60 @@ struct MemoEditView: View {
             }
             .presentationDetents([.medium, .large])
         }
+        .sheet(isPresented: $showTagPicker) {
+            MemoTagPickerSheet(
+                selectedTags: viewModel.tags
+            ) { tags in
+                tagsText = tags.joined(separator: ", ")
+                markDirtyAndScheduleSave()
+            }
+            .presentationDetents([.medium, .large])
+        }
         .sheet(isPresented: $showTemplatePicker) {
             TemplatePickerSheet { seed in
                 requestApplyTemplate(seed)
             }
+        }
+        .sheet(item: $aiSelection) { selection in
+            AiAssistantSheet(
+                title: title,
+                selectedMarkdown: selection.markdown.isEmpty ? selection.text : selection.markdown
+            ) { draft, mode in
+                let applied = await SharedTipTapRuntime.editor.applyAiSelectionDraft(
+                    draft,
+                    append: mode == .append
+                )
+                guard applied else {
+                    throw NSError(
+                        domain: "EdgeEverAiSelection",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: env.preferences.t(
+                            "选区已失效，请重新选择文本后再试。",
+                            en: "The selection expired. Select the text again and retry."
+                        )]
+                    )
+                }
+                await pullEditorSnapshotIfPossible()
+                markDirtyAndScheduleSave()
+                presentAiUndo()
+            }
+            .presentationDetents([.large])
+        }
+        .alert(
+            env.preferences.t("请先选择正文", en: "Select text first"),
+            isPresented: $showEmptyAiSelectionAlert
+        ) {
+            Button(env.preferences.t("好的", en: "OK"), role: .cancel) {}
+        } message: {
+            Text(env.preferences.t(
+                "在正文中选中一段文字，然后再点 AI。",
+                en: "Select some text in the note body, then tap AI again."
+            ))
+        }
+        .alert(smartTagAlertTitle, isPresented: $showSmartTagAlert) {
+            Button(env.preferences.t("好的", en: "OK"), role: .cancel) {}
+        } message: {
+            Text(smartTagAlertMessage)
         }
         .alert(
             env.preferences.t("应用模板？", en: "Apply template?"),
@@ -129,22 +237,47 @@ struct MemoEditView: View {
             .presentationDetents([.height(360), .medium])
             .presentationDragIndicator(.hidden)
         }
+        .confirmationDialog(
+            env.preferences.t("添加图片", en: "Add image"),
+            isPresented: $showImageSourcePicker,
+            titleVisibility: .visible
+        ) {
+            Button(env.preferences.t("拍照", en: "Take photo")) {
+                scheduleCameraCapture()
+            }
+            Button(env.preferences.t("从相册选择", en: "Choose from library")) {
+                scheduleImagePicker(.library)
+            }
+            Button(env.preferences.t("取消", en: "Cancel"), role: .cancel) {}
+        } message: {
+            Text(env.preferences.t("直接拍照或选择已有照片", en: "Take a new photo or choose an existing one"))
+        }
         // fullScreenCover avoids nested-sheet bugs when MemoEditView itself is already a fullScreenCover.
         // PHPicker + NSItemProvider (not SwiftUI PhotosPicker/Transferable) is the reliable path.
-        .fullScreenCover(isPresented: $showImagePicker) {
-            SystemImagePicker { result in
-                showImagePicker = false
-                switch result {
-                case .cancelled:
-                    break
-                case .failed(let message):
-                    error = message
-                    showUploadError = true
-                case .picked(let data, let filename):
-                    Task { await insertImageData(data, filename: filename) }
+        .fullScreenCover(item: $imagePickerRoute) { route in
+            Group {
+                switch route {
+                case .camera:
+                    SystemCameraPicker(onFinish: handleImagePickerResult)
+                case .library:
+                    SystemImagePicker(onFinish: handleImagePickerResult)
                 }
             }
             .ignoresSafeArea()
+        }
+        .alert(
+            env.preferences.t("无法使用相机", en: "Unable to use camera"),
+            isPresented: $showCameraAccessAlert
+        ) {
+            Button(env.preferences.t("取消", en: "Cancel"), role: .cancel) {}
+            if cameraAccessCanOpenSettings {
+                Button(env.preferences.t("前往设置", en: "Open settings")) {
+                    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                    UIApplication.shared.open(url)
+                }
+            }
+        } message: {
+            Text(cameraAccessMessage)
         }
         .alert(
             env.preferences.t("图片上传失败", en: "Image upload failed"),
@@ -164,9 +297,12 @@ struct MemoEditView: View {
                 // One open-edit focus only (SharedTipTapRuntime also focuses once per document).
                 SharedTipTapRuntime.editor.focusEnd()
             }
+            await importInitialSharedImagesIfNeeded()
         }
         .onDisappear {
-            saveTask?.cancel()
+            smartTagTask?.cancel()
+            smartTagTask = nil
+            viewModel.cancelScheduledSave()
             // Create commit is owned by Back / Done (Android `requestClose` = createMutation).
             // Only flush edit sessions, or create-after-image-materialize if still dirty and
             // the cover was dismissed without going through handleBack.
@@ -229,6 +365,26 @@ struct MemoEditView: View {
                 }
 
                 Button {
+                    Task {
+                        if let selection = await SharedTipTapRuntime.editor.captureAiSelection() {
+                            aiSelection = selection
+                        } else {
+                            showEmptyAiSelectionAlert = true
+                        }
+                    }
+                } label: {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(editorReady && !busyChrome ? AppTheme.accentStrong : AppTheme.muted)
+                        .frame(width: 36, height: 36)
+                        .background(AppTheme.accentSoft)
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!editorReady || busyChrome)
+                .accessibilityLabel(env.preferences.t("用 AI 处理选中内容", en: "Use AI on selection"))
+
+                Button {
                     Task { await handleDone() }
                 } label: {
                     Group {
@@ -244,7 +400,7 @@ struct MemoEditView: View {
                     }
                     .frame(minWidth: 58, minHeight: 36)
                     .padding(.horizontal, 12)
-                    .background(canSubmitDone ? AppTheme.title : Color(hex: 0xE2E8F0))
+                    .background(canSubmitDone ? AppTheme.title : AppTheme.disabledFill)
                     .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
@@ -257,7 +413,7 @@ struct MemoEditView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(minHeight: 52)
-        .background(Color.white)
+        .background(AppTheme.card)
         .overlay(alignment: .bottom) {
             Rectangle().fill(AppTheme.cardBorder).frame(height: 1)
         }
@@ -270,7 +426,10 @@ struct MemoEditView: View {
         VStack(alignment: .leading, spacing: 0) {
             TextField(
                 env.preferences.t("无标题笔记", en: "Untitled note"),
-                text: $title
+                text: Binding(
+                    get: { viewModel.title },
+                    set: { viewModel.title = $0 }
+                )
             )
             .font(.system(size: 28, weight: .heavy))
             .foregroundStyle(AppTheme.title)
@@ -303,39 +462,58 @@ struct MemoEditView: View {
                 .accessibilityLabel(env.preferences.t("所在笔记本", en: "Notebook"))
                 .accessibilityIdentifier(CreateMemoChrome.notebook)
 
-                TextField(
-                    env.preferences.t("添加标签，用逗号分隔", en: "Add tags, comma separated"),
-                    text: $tagsText
-                )
-                .font(.system(size: 15))
-                .foregroundStyle(AppTheme.secondary)
-                .textFieldStyle(.plain)
-                .frame(minHeight: 36)
-                .onChange(of: tagsText) { _, _ in markDirtyAndScheduleSave() }
+                Button {
+                    Task {
+                        await pullEditorSnapshotIfPossible()
+                        showTagPicker = true
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(viewModel.tags.isEmpty
+                             ? env.preferences.t("添加标签", en: "Add tags")
+                             : viewModel.tags.map { "#\($0)" }.joined(separator: ", "))
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .font(.system(size: 15))
+                    .foregroundStyle(viewModel.tags.isEmpty ? AppTheme.muted : AppTheme.secondary)
+                    .frame(minHeight: 36)
+                }
+                .buttonStyle(.plain)
                 .accessibilityLabel(env.preferences.t("笔记标签", en: "Tags"))
                 .accessibilityIdentifier(CreateMemoChrome.tags)
 
                 Button {
-                    // Resign WebView first responder so the picker sheet is not blocked.
-                    UIApplication.shared.sendAction(
-                        #selector(UIResponder.resignFirstResponder),
-                        to: nil,
-                        from: nil,
-                        for: nil
-                    )
-                    error = nil
-                    showImagePicker = true
+                    generateAndApplySmartTags()
                 } label: {
-                    Image(systemName: "photo")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(isUploading ? AppTheme.muted : AppTheme.slate)
-                        .frame(width: 36, height: 32)
-                        .contentShape(Rectangle())
+                    Group {
+                        if isSuggestingTags {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(AppTheme.accentStrong)
+                        } else {
+                            Image(systemName: smartTagsAdded ? "checkmark" : "tag.badge.plus")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(AppTheme.accentStrong)
+                        }
+                    }
+                    .frame(width: 34, height: 34)
+                    .background(smartTagsAdded ? AppTheme.accentSoft : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .disabled(isUploading)
-                .accessibilityLabel(env.preferences.t("插入图片", en: "Insert image"))
-                .accessibilityIdentifier(CreateMemoChrome.imageTool)
+                .disabled(isSuggestingTags || busyChrome || viewModel.tags.count >= 24
+                    || (title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && contentMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                .opacity((busyChrome || viewModel.tags.count >= 24) ? 0.45 : 1)
+                .accessibilityLabel(env.preferences.t(
+                    isSuggestingTags ? "正在生成智能标签" : smartTagsAdded ? "智能标签已添加" : "智能标签",
+                    en: isSuggestingTags ? "Generating smart tags" : smartTagsAdded ? "Smart tags added" : "Smart tags"
+                ))
+                .accessibilityIdentifier(CreateMemoChrome.smartTags)
+
             }
             .frame(minHeight: 40)
             .accessibilityIdentifier(CreateMemoChrome.metaRow)
@@ -350,11 +528,15 @@ struct MemoEditView: View {
                         markdown: contentMarkdown,
                         baseURL: env.session.session.map { URL(string: $0.baseUrl) } ?? nil,
                         token: env.session.session?.token,
+                        locale: env.preferences.isEnglish ? "en-US" : "zh-CN",
+                        theme: colorScheme == .dark ? "dark" : "light",
+                        placeholder: env.preferences.t("开始输入…", en: "Start writing…"),
                         onChange: { md, json in
                             guard contentHydrated, !suppressPersistence else { return }
-                            // Always accept editor truth, even mid-upload (save stays gated).
-                            // @tiptap/markdown can drop text or images — reconcile carefully.
-                            applyEditorPayload(markdown: md, json: json)
+                            // Accept the JSON and Markdown emitted by the same TipTap transaction.
+                            // Native code only falls back to its compatibility serializer when the
+                            // editor cannot provide Markdown at all.
+                            viewModel.applyEditorPayload(markdown: md, json: json)
                             if !isUploading {
                                 markDirtyAndScheduleSave()
                             } else {
@@ -365,6 +547,18 @@ struct MemoEditView: View {
                             resourceTarget = target
                         },
                         onImagePreview: nil,
+                        onPickImage: {
+                            guard !isUploading else { return }
+                            UIApplication.shared.sendAction(
+                                #selector(UIResponder.resignFirstResponder),
+                                to: nil,
+                                from: nil,
+                                for: nil
+                            )
+                            error = nil
+                            showImageSourcePicker = true
+                        },
+                        onSearchResult: nil,
                         onBodyReady: {
                             // Do not focusEnd here — bodyReady also fires on typing re-binds.
                             // Open-edit focus is owned by SharedTipTapRuntime (once per document).
@@ -383,12 +577,12 @@ struct MemoEditView: View {
                             .foregroundStyle(AppTheme.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.white)
+                    .background(AppTheme.card)
                     .allowsHitTesting(false)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.white)
+            .background(AppTheme.card)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -408,6 +602,82 @@ struct MemoEditView: View {
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    // MARK: - Image source
+
+    private func scheduleImagePicker(_ route: ImagePickerRoute) {
+        Task { @MainActor in
+            // Let the confirmation dialog finish dismissing before presenting UIKit.
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            imagePickerRoute = route
+        }
+    }
+
+    private func scheduleCameraCapture() {
+        Task { @MainActor in
+            // Permission prompts and full-screen covers must not race the source dialog dismissal.
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            beginCameraCapture()
+        }
+    }
+
+    @MainActor
+    private func beginCameraCapture() {
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        switch CameraCaptureAccess.nextStep(
+            isCameraAvailable: SystemCameraPicker.isAvailable,
+            authorizationStatus: status
+        ) {
+        case .openCamera:
+            imagePickerRoute = .camera
+        case .requestPermission:
+            Task {
+                let granted = await AVCaptureDevice.requestAccess(for: .video)
+                await MainActor.run {
+                    if granted {
+                        imagePickerRoute = .camera
+                    } else {
+                        showCameraSettingsAlert()
+                    }
+                }
+            }
+        case .showSettings:
+            showCameraSettingsAlert()
+        case .unavailable:
+            cameraAccessCanOpenSettings = false
+            cameraAccessMessage = env.preferences.t(
+                "此设备没有可用相机。",
+                en: "This device does not have an available camera."
+            )
+            showCameraAccessAlert = true
+        }
+    }
+
+    @MainActor
+    private func showCameraSettingsAlert() {
+        cameraAccessCanOpenSettings = true
+        cameraAccessMessage = env.preferences.t(
+            "请前往系统设置，允许 EdgeEver 使用相机后再试。",
+            en: "Open system settings and allow EdgeEver to use the camera, then try again."
+        )
+        showCameraAccessAlert = true
+    }
+
+    @MainActor
+    private func handleImagePickerResult(_ result: ImagePickerResult) {
+        imagePickerRoute = nil
+        switch result {
+        case .cancelled:
+            break
+        case .failed(let message):
+            error = message
+            showUploadError = true
+        case .picked(let data, let filename):
+            Task { _ = await insertImageData(data, filename: filename) }
+        }
     }
 
     // MARK: - Derived state
@@ -459,23 +729,79 @@ struct MemoEditView: View {
     }
 
     private var tags: [String] {
-        tagsText
-            .split(whereSeparator: { ",， ".contains($0) })
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        viewModel.tags
     }
 
     // MARK: - Actions
 
     private func markDirtyAndScheduleSave() {
-        guard !suppressPersistence else { return }
-        // Avoid autosaving mid-upload (placeholder / incomplete body).
-        guard !isUploading else {
-            isDirty = true
-            return
-        }
-        isDirty = true
+        viewModel.markDirty()
+        guard !suppressPersistence, !isUploading else { return }
         scheduleSave()
+    }
+
+    private func generateAndApplySmartTags() {
+        guard !isSuggestingTags, !busyChrome, viewModel.tags.count < 24 else { return }
+        smartTagTask?.cancel()
+        isSuggestingTags = true
+        smartTagsAdded = false
+        smartTagTask = Task { @MainActor in
+            await pullEditorSnapshotIfPossible()
+            let currentTags = viewModel.tags
+            let input = AiTagSuggestionsInput(
+                title: title,
+                contentMarkdown: contentMarkdown,
+                currentTags: currentTags,
+                locale: env.preferences.isEnglish ? "en-US" : "zh-CN"
+            )
+            do {
+                let response = try await env.session.client.suggestAiTags(input)
+                try Task.checkCancellation()
+                let availableSlots = max(0, 24 - currentTags.count)
+                let additions = Array(response.suggestions
+                    .map(\.name)
+                    .filter { name in
+                        !currentTags.contains { $0.caseInsensitiveCompare(name) == .orderedSame }
+                    }
+                    .prefix(availableSlots))
+                guard !additions.isEmpty else {
+                    isSuggestingTags = false
+                    smartTagAlertTitle = env.preferences.t("智能标签", en: "Smart tags")
+                    smartTagAlertMessage = env.preferences.t(
+                        "没有找到适合这篇笔记的新标签。",
+                        en: "No useful new tags were found for this note."
+                    )
+                    showSmartTagAlert = true
+                    smartTagTask = nil
+                    return
+                }
+                tagsText = (currentTags + additions).joined(separator: ", ")
+                markDirtyAndScheduleSave()
+                isSuggestingTags = false
+                smartTagsAdded = true
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard !Task.isCancelled else { return }
+                smartTagsAdded = false
+                smartTagTask = nil
+            } catch is CancellationError {
+                isSuggestingTags = false
+            } catch let apiError as APIError where apiError.code == "ai_not_configured" {
+                isSuggestingTags = false
+                smartTagAlertTitle = env.preferences.t("智能标签生成失败", en: "Couldn't generate smart tags")
+                smartTagAlertMessage = env.preferences.t(
+                    "请先在“AI 集成”中配置默认模型。",
+                    en: "Configure a model in AI Integrations first."
+                )
+                showSmartTagAlert = true
+                smartTagTask = nil
+            } catch {
+                isSuggestingTags = false
+                smartTagAlertTitle = env.preferences.t("智能标签生成失败", en: "Couldn't generate smart tags")
+                smartTagAlertMessage = error.localizedDescription
+                showSmartTagAlert = true
+                smartTagTask = nil
+            }
+        }
     }
 
     private func requestApplyTemplate(_ seed: CreateMemoSeed) {
@@ -493,11 +819,10 @@ struct MemoEditView: View {
         tagsText = seed.tagsText
         contentMarkdown = seed.contentMarkdown
         // Empty stub JSON forces TipTapContentSource to open from markdown structure.
-        contentJSON = emptyDocJSON
+        contentJSON = MemoEditViewModel.emptyDocJSON
         baselineMarkdown = seed.contentMarkdown
         editorReady = false
-        isDirty = true
-        scheduleSave()
+        markDirtyAndScheduleSave()
         // Re-push body into the shared editor runtime.
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 50_000_000)
@@ -549,70 +874,40 @@ struct MemoEditView: View {
     /// Pull markdown/JSON from TipTap so saves don't race the async change bridge.
     private func pullEditorSnapshotIfPossible() async {
         guard let snap = await SharedTipTapRuntime.editor.snapshotContent() else { return }
-        applyEditorPayload(markdown: snap.markdown, json: snap.json)
+        viewModel.applyEditorPayload(markdown: snap.markdown, json: snap.json)
     }
 
-    /// Merge TipTap bridge payloads.
-    /// **TipTap JSON is the only structural source of truth** (node order = image above/below text).
-    /// Markdown is always derived from JSON so we never "append missing images at the end"
-    /// and flip 图文顺序 when the serializer drops an image mid-document.
-    private func applyEditorPayload(markdown: String, json: String) {
-        let prevText = EditorContentCodec.plainText(markdown: contentMarkdown, json: contentJSON)
-
-        let trimmedJSON = json.trimmingCharacters(in: .whitespacesAndNewlines)
-        let nextJSON: String = {
-            if !trimmedJSON.isEmpty, EditorContentCodec.looksLikeTipTapDoc(trimmedJSON) {
-                return trimmedJSON
-            }
-            return contentJSON
-        }()
-
-        // Derive markdown from JSON whenever possible — preserves block order exactly.
-        let nextMD: String = {
-            if let derived = EditorContentCodec.markdownFromTipTapJSON(nextJSON) {
-                return derived
-            }
-            if !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return markdown
-            }
-            return contentMarkdown
-        }()
-
-        let nextText = EditorContentCodec.plainText(markdown: nextMD, json: nextJSON)
-        let nextHasImage = EditorContentCodec.containsImageNode(nextJSON)
-            || nextMD.contains("![")
-
-        // Hard guard: never accept a payload that strips substantial text while leaving media.
-        if prevText.count >= 8, nextText.count < max(4, prevText.count / 2), nextHasImage {
-            NSLog(
-                "MemoEditView: reject text-stripping payload prevText=%d nextText=%d",
-                prevText.count, nextText.count
-            )
-            // Do NOT append images at the end — that reorders 图文. Keep prior body.
-            return
+    private func presentAiUndo() {
+        let token = UUID()
+        aiUndoToken = token
+        Task {
+            try? await Task.sleep(nanoseconds: 6_500_000_000)
+            guard !Task.isCancelled, aiUndoToken == token else { return }
+            aiUndoToken = nil
         }
-
-        contentJSON = nextJSON
-        contentMarkdown = nextMD
     }
 
     private func loadInitial() async {
         guard let scope = env.session.dataScope else { return }
         switch mode {
         case .create(let nb, let seed):
+            // A regular create must never inherit state from the previous create
+            // session. Clear both in-memory fields and any legacy persisted draft.
+            title = ""
+            tagsText = ""
+            contentMarkdown = ""
+            contentJSON = MemoEditViewModel.emptyDocJSON
             notebookId = nb
+            memoId = nil
+            expectedRevision = nil
+            expectedContentHash = nil
+            try? env.drafts.clear(scope: scope, key: DraftRepository.newKey)
             if let seed {
-                // Template / explicit seed wins over local new-note draft (Android initialDraft).
+                // Only explicit template / clip / share input may prefill a create.
                 title = seed.title
                 tagsText = seed.tagsText
                 contentMarkdown = seed.contentMarkdown
-                contentJSON = emptyDocJSON
-            } else if let draft = try? env.drafts.read(scope: scope, key: DraftRepository.newKey) {
-                title = draft.title
-                tagsText = draft.tagsText
-                contentMarkdown = draft.contentMarkdown
-                contentJSON = draft.contentJson ?? contentJSON
-                if !draft.notebookId.isEmpty { notebookId = draft.notebookId }
+                contentJSON = MemoEditViewModel.emptyDocJSON
             }
             baselineMarkdown = contentMarkdown
         case .edit(let id):
@@ -679,40 +974,20 @@ struct MemoEditView: View {
     }
 
     private func scheduleSave() {
-        guard !suppressPersistence else { return }
-        saveTask?.cancel()
-        saveTask = Task {
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            guard !Task.isCancelled, !suppressPersistence else { return }
+        viewModel.scheduleSave {
             await persistDraftOrQueue()
         }
-    }
-
-    /// Reject autosave that would wipe a non-empty note with an empty / image-only boot payload.
-    private var wouldClobberNonEmptyBody: Bool {
-        guard !isCreate else { return false }
-        let next = contentMarkdown.trimmingCharacters(in: .whitespacesAndNewlines)
-        let base = baselineMarkdown.trimmingCharacters(in: .whitespacesAndNewlines)
-        if next.isEmpty && !base.isEmpty { return true }
-
-        let baseText = EditorContentCodec.plainTextFromMarkdown(baselineMarkdown)
-        let nextText = EditorContentCodec.plainText(markdown: contentMarkdown, json: contentJSON)
-        let nextHasImage = contentMarkdown.contains("/api/v1/resources/")
-            || contentJSON.contains("/api/v1/resources/")
-            || contentJSON.contains("\"type\":\"image\"")
-        // Image-only body while baseline had real text → refuse (this produced empty notes).
-        if baseText.count >= 8, nextText.count < max(4, baseText.count / 2), nextHasImage {
-            return true
-        }
-        return false
     }
 
     private func persistDraftOrQueue() async {
         guard let scope = env.session.dataScope else { return }
         guard contentHydrated, !suppressPersistence else { return }
-        // Last chance: re-sync markdown from JSON so outbox markdown cannot drop text.
-        reconcileMarkdownWithJSON()
-        if wouldClobberNonEmptyBody {
+        guard !isSaving else { return }
+        let generationAtStart = editGeneration
+        // Last chance: only backfill Markdown when the editor supplied none. Never replace
+        // valid TipTap Markdown with the intentionally limited native compatibility serializer.
+        viewModel.reconcileMarkdownWithJSON()
+        if viewModel.wouldClobberNonEmptyBody(isCreate: isCreate) {
             NSLog(
                 "MemoEditView: skip persist — refusing body clobber baseText=%d nextText=%d",
                 EditorContentCodec.plainTextFromMarkdown(baselineMarkdown).count,
@@ -724,51 +999,22 @@ struct MemoEditView: View {
         isSaving = true
         defer {
             isSaving = false
-            isDirty = false
+            if generationAtStart == editGeneration {
+                isDirty = false
+            } else if !suppressPersistence {
+                scheduleSave()
+            }
         }
         let now = EdgeEverDate.nowString()
 
-        // Create mode before materialize: draft only.
-        // Create mode after materialize (image upload) OR edit: mirror + outbox update.
+        // A non-materialized create remains in memory until Done/Back commits it.
+        // Persisting it under the shared `new` key would leak this content into a
+        // later create session.
         if isCreate, !hasMaterializedServerMemo {
-            try? env.drafts.write(
-                scope: scope,
-                draft: MemoDraft(
-                    draftKey: DraftRepository.newKey,
-                    title: title,
-                    contentMarkdown: contentMarkdown,
-                    contentJson: contentJSON,
-                    notebookId: notebookId,
-                    tagsText: tagsText,
-                    expectedRevision: nil,
-                    updatedAt: now
-                )
-            )
-            NSLog(
-                "MemoEditView persist draft-only mdLen=%d hasImg=%d",
-                contentMarkdown.count,
-                contentMarkdown.contains("/api/v1/resources/") ? 1 : 0
-            )
             return
         }
 
         guard let memoId, !memoId.hasPrefix("local:") else {
-            // Offline local: create still in flight — keep draft.
-            if isCreate {
-                try? env.drafts.write(
-                    scope: scope,
-                    draft: MemoDraft(
-                        draftKey: DraftRepository.newKey,
-                        title: title,
-                        contentMarkdown: contentMarkdown,
-                        contentJson: contentJSON,
-                        notebookId: notebookId,
-                        tagsText: tagsText,
-                        expectedRevision: nil,
-                        updatedAt: now
-                    )
-                )
-            }
             return
         }
 
@@ -776,7 +1022,7 @@ struct MemoEditView: View {
             NSLog("MemoEditView persist: mirror miss for \(memoId)")
             return
         }
-        memo.title = title.isEmpty ? "无标题笔记" : title
+        memo.title = title.isEmpty ? env.preferences.t("无标题笔记", en: "Untitled note") : title
         memo.contentMarkdown = contentMarkdown
         memo.contentText = contentMarkdown
         memo.tags = tags
@@ -808,19 +1054,16 @@ struct MemoEditView: View {
         )
         expectedRevision = rev
         expectedContentHash = hash
-        try? env.drafts.write(
-            scope: scope,
-            draft: MemoDraft(
-                draftKey: isCreate ? DraftRepository.newKey : DraftRepository.memoKey(memo.id),
-                title: title,
-                contentMarkdown: contentMarkdown,
-                contentJson: contentJSON,
-                notebookId: notebookId,
-                tagsText: tagsText,
-                expectedRevision: rev,
-                updatedAt: now
+        if !isCreate {
+            try? env.drafts.write(
+                scope: scope,
+                draft: viewModel.makeDraft(
+                    key: DraftRepository.memoKey(memo.id),
+                    expectedRevision: rev,
+                    updatedAt: now
+                )
             )
-        )
+        }
         NSLog(
             "MemoEditView persist update memo=%@ baseRev=%d mdLen=%d hasImg=%d jsonHasImg=%d",
             memo.id,
@@ -843,15 +1086,7 @@ struct MemoEditView: View {
             error = env.preferences.t("请选择笔记本", en: "Choose a notebook")
             return
         }
-        if isCreating { return }
-        isCreating = true
-        // Block autosave / late TipTap change before any await so the `new` draft cannot
-        // be rewritten after we clear it (next FAB create must open empty).
-        suppressPersistence = true
-        isDirty = false
-        saveTask?.cancel()
-        defer { isCreating = false }
-        do {
+        guard let finishedId = await viewModel.performCreateCommit(operation: {
             // Android createMutation: if image materialize already created a server memo,
             // Done/Back updates that memo — never mint a second local: create.
             let outcome = try MemoCreateCommit.commit(
@@ -861,6 +1096,7 @@ struct MemoEditView: View {
                 expectedContentHash: expectedContentHash,
                 notebookId: notebookId,
                 title: title,
+                untitledTitle: env.preferences.t("无标题笔记", en: "Untitled note"),
                 contentMarkdown: contentMarkdown,
                 contentJSON: contentJSON,
                 tags: tags,
@@ -873,7 +1109,7 @@ struct MemoEditView: View {
                 memoId = id
             }
             // Prefer mirror id after sync (create may remap local: → server id).
-            var finishedId = memoId
+            var resolvedFinishedId = memoId!
             // Belt-and-suspenders: clear create draft again after commit (race with in-flight write).
             try? env.drafts.clear(scope: scope, key: DraftRepository.newKey)
             await env.runSyncCycle()
@@ -881,25 +1117,27 @@ struct MemoEditView: View {
                 expectedRevision = refreshed.revision
                 expectedContentHash = refreshed.contentHash
                 memoId = refreshed.id
-                finishedId = refreshed.id
+                resolvedFinishedId = refreshed.id
             }
             // Clear again after sync — materialize/persist paths may have re-touched `new`.
             try? env.drafts.clear(scope: scope, key: DraftRepository.newKey)
-            if let finishedId {
-                onCreateFinished?(finishedId)
-            }
-            // Create modal sits on the list already; WorkspaceView reloads on cover dismiss.
-            dismiss()
-        } catch {
-            // Allow retry / further edits after a failed commit.
-            suppressPersistence = false
-            self.error = error.localizedDescription
-        }
+            return resolvedFinishedId
+        }) else { return }
+        onCreateFinished?(finishedId)
+        // Create modal sits on the list already; WorkspaceView reloads on cover dismiss.
+        dismiss()
     }
 
     private func flushPending() async {
-        await persistDraftOrQueue()
+        await drainPendingSave()
         await env.runSyncCycle()
+    }
+
+    /// Wait for an in-flight autosave before forcing the latest editor generation to disk.
+    private func drainPendingSave() async {
+        await viewModel.drainScheduledSave {
+            await persistDraftOrQueue()
+        }
     }
 
     /// K24 materialize: ensure a server memo id before image upload.
@@ -935,10 +1173,10 @@ struct MemoEditView: View {
 
         // Capture latest editor body before minting the server memo (avoid stale empty markdown).
         await pullEditorSnapshotIfPossible()
-        reconcileMarkdownWithJSON()
+        viewModel.reconcileMarkdownWithJSON()
         let memo = try await env.session.client.createMemo(
             notebookId: notebookId.isEmpty ? (availableNotebooks.first?.id ?? "") : notebookId,
-            title: title.isEmpty ? "无标题笔记" : title,
+            title: title.isEmpty ? env.preferences.t("无标题笔记", en: "Untitled note") : title,
             contentMarkdown: contentMarkdown,
             tags: tags
         )
@@ -952,11 +1190,8 @@ struct MemoEditView: View {
     }
 
     /// Upload bytes from the system PHPicker and insert into TipTap.
-    private func insertImageData(_ data: Data, filename: String) async {
-        isUploading = true
-        error = nil
-        defer { isUploading = false }
-        do {
+    private func insertImageData(_ data: Data, filename: String) async -> Bool {
+        let succeeded = await viewModel.performUpload {
             NSLog("MemoEditView insertImageData: start bytes=%d name=%@", data.count, filename)
             let compress = env.preferences.useCompression
             let prepared = compress
@@ -1011,14 +1246,14 @@ struct MemoEditView: View {
             // is truly missing — never append a second image node at document end.
             await pullEditorSnapshotIfPossible()
             if !EditorContentCodec.jsonContainsResource(contentJSON, src: imageSrc) {
-                ensureImageInContent(imageSrc: imageSrc, alt: prepared.filename)
+                viewModel.ensureImageInContent(imageSrc: imageSrc, alt: prepared.filename)
             } else {
-                reconcileMarkdownWithJSON()
+                viewModel.reconcileMarkdownWithJSON()
             }
+            editGeneration &+= 1
             isDirty = true
             // Persist immediately so leaving the editor cannot orphan the resource.
-            saveTask?.cancel()
-            await persistDraftOrQueue()
+            await drainPendingSave()
             NSLog(
                 "MemoEditView insertImageData: done src=%@ mdHas=%d jsonHas=%d textLen=%d",
                 imageSrc,
@@ -1026,32 +1261,30 @@ struct MemoEditView: View {
                 EditorContentCodec.jsonContainsResource(contentJSON, src: imageSrc) ? 1 : 0,
                 EditorContentCodec.plainText(markdown: contentMarkdown, json: contentJSON).count
             )
-        } catch {
-            self.error = error.localizedDescription
+        }
+        if !succeeded {
             showUploadError = true
-            NSLog("MemoEditView insertImageData failed: \(error)")
+            NSLog("MemoEditView insertImageData failed: %@", error ?? "unknown")
         }
+        return succeeded
     }
 
-    private static func protectedResourceRefs(in text: String) -> [String] {
-        EditorContentCodec.protectedResourceRefs(in: text)
-    }
-
-    /// Rebuild markdown from TipTap JSON so block order matches the editor (and detail view).
-    private func reconcileMarkdownWithJSON() {
-        if let derived = EditorContentCodec.markdownFromTipTapJSON(contentJSON) {
-            contentMarkdown = derived
+    private func importInitialSharedImagesIfNeeded() async {
+        guard !didImportSharedImages, !initialSharedImages.isEmpty else { return }
+        didImportSharedImages = true
+        for image in initialSharedImages {
+            do {
+                let data = try Data(contentsOf: image.fileURL)
+                let succeeded = await insertImageData(data, filename: image.filename)
+                env.shareHandoff.removeImage(image)
+                guard succeeded else { return }
+            } catch {
+                env.shareHandoff.removeImage(image)
+                self.error = error.localizedDescription
+                showUploadError = true
+                return
+            }
         }
-    }
-
-    /// Last-resort: image missing from JSON after insert. Append only then, and rebuild md from JSON.
-    private func ensureImageInContent(imageSrc: String, alt: String) {
-        if EditorContentCodec.jsonContainsResource(contentJSON, src: imageSrc) {
-            reconcileMarkdownWithJSON()
-            return
-        }
-        contentJSON = EditorContentCodec.appendingImage(toJSON: contentJSON, src: imageSrc, alt: alt)
-        reconcileMarkdownWithJSON()
     }
 
     /// When compression is off, still normalize HEIC → JPEG for reliable upload mime.
@@ -1075,347 +1308,159 @@ struct MemoEditView: View {
     }
 }
 
-// MARK: - TipTap content helpers (markdown serializer is lossy around images)
+private struct MemoTagPickerSheet: View {
+    @Environment(AppEnvironment.self) private var env
+    @Environment(\.dismiss) private var dismiss
+    @State private var selection: [String]
+    @State private var query = ""
+    @State private var availableTags: [TagSummary] = []
+    @State private var error: String?
+    let onChange: ([String]) -> Void
 
-enum EditorContentCodec {
-    static func protectedResourceRefs(in text: String) -> [String] {
-        guard let regex = try? NSRegularExpression(
-            pattern: #"/api/v1/resources/[A-Za-z0-9_-]+(?:/blob)?"#,
-            options: []
-        ) else { return [] }
-        let ns = text as NSString
-        let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
-        var seen = Set<String>()
-        var refs: [String] = []
-        for match in matches {
-            let ref = ns.substring(with: match.range)
-            if seen.insert(ref).inserted { refs.append(ref) }
-        }
-        return refs
+    init(
+        selectedTags: [String],
+        onChange: @escaping ([String]) -> Void
+    ) {
+        _selection = State(initialValue: selectedTags)
+        self.onChange = onChange
     }
 
-    static func looksLikeTipTapDoc(_ json: String) -> Bool {
-        guard let data = json.data(using: .utf8),
-              let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = doc["type"] as? String
-        else { return false }
-        return type == "doc"
+    private var normalizedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "^#", with: "", options: .regularExpression)
     }
 
-    static func containsImageNode(_ json: String) -> Bool {
-        json.contains("\"type\":\"image\"") || json.contains("\"type\": \"image\"")
+    private var visibleTags: [TagSummary] {
+        guard !normalizedQuery.isEmpty else { return availableTags }
+        return availableTags.filter { $0.name.localizedCaseInsensitiveContains(normalizedQuery) }
     }
 
-    /// Match resource by id so `/blob` vs bare path doesn't look like a missing image.
-    static func jsonContainsResource(_ json: String, src: String) -> Bool {
-        if json.contains(src) { return true }
-        if let id = ResourceCache.resourceId(from: src), json.contains(id) {
-            return true
-        }
-        return false
+    private var hasExactMatch: Bool {
+        availableTags.contains { $0.name.caseInsensitiveCompare(normalizedQuery) == .orderedSame }
     }
 
-    static func plainText(markdown: String, json: String) -> String {
-        let a = plainTextFromMarkdown(markdown)
-        let b = plainTextFromJSON(json)
-        return a.count >= b.count ? a : b
-    }
-
-    static func plainTextFromMarkdown(_ markdown: String) -> String {
-        var s = markdown
-        // Strip image / link targets; keep link labels lightly.
-        s = s.replacingOccurrences(of: #"!\[[^\]]*\]\([^)]*\)"#, with: " ", options: .regularExpression)
-        s = s.replacingOccurrences(of: #"\[[^\]]*\]\([^)]*\)"#, with: " ", options: .regularExpression)
-        s = s.replacingOccurrences(of: #"[#>*`_~\-]+"#, with: " ", options: .regularExpression)
-        return s
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-    }
-
-    static func plainTextFromJSON(_ json: String) -> String {
-        guard let data = json.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data)
-        else { return "" }
-        var parts: [String] = []
-        collectText(obj, into: &parts)
-        return parts.joined(separator: " ")
-    }
-
-    private static func collectText(_ any: Any, into parts: inout [String]) {
-        if let dict = any as? [String: Any] {
-            if let type = dict["type"] as? String, type == "text", let text = dict["text"] as? String, !text.isEmpty {
-                parts.append(text)
-            }
-            if let content = dict["content"] as? [Any] {
-                for child in content { collectText(child, into: &parts) }
-            }
-            return
-        }
-        if let arr = any as? [Any] {
-            for child in arr { collectText(child, into: &parts) }
-        }
-    }
-
-    /// Best-effort TipTap JSON → markdown so sync wire format keeps body text + images.
-    static func markdownFromTipTapJSON(_ json: String) -> String? {
-        guard let data = json.data(using: .utf8),
-              let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = doc["content"] as? [Any]
-        else { return nil }
-        var lines: [String] = []
-        for node in content {
-            guard let dict = node as? [String: Any], let type = dict["type"] as? String else { continue }
-            switch type {
-            case "paragraph":
-                lines.append(inlineMarkdown(dict["content"] as? [Any] ?? []))
-            case "heading":
-                let level = (dict["attrs"] as? [String: Any])?["level"] as? Int ?? 2
-                let prefix = String(repeating: "#", count: min(max(level, 1), 6))
-                lines.append("\(prefix) \(inlineMarkdown(dict["content"] as? [Any] ?? []))")
-            case "image":
-                let attrs = dict["attrs"] as? [String: Any] ?? [:]
-                let src = attrs["src"] as? String ?? ""
-                let alt = attrs["alt"] as? String ?? ""
-                if !src.isEmpty { lines.append("![\(alt)](\(src))") }
-            case "bulletList", "orderedList":
-                if let items = dict["content"] as? [Any] {
-                    for item in items {
-                        guard let itemDict = item as? [String: Any] else { continue }
-                        let text = blockText(itemDict)
-                        if !text.isEmpty { lines.append("- \(text)") }
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 12) {
+                if !selection.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(selection, id: \.self) { tag in
+                                Button {
+                                    toggle(tag)
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Text("#\(tag)")
+                                        Image(systemName: "xmark")
+                                    }
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(AppTheme.accent)
+                                    .padding(.horizontal, 11)
+                                    .frame(minHeight: 32)
+                                    .background(AppTheme.accentSoft)
+                                    .clipShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel(env.preferences.t("移除标签 \(tag)", en: "Remove tag \(tag)"))
+                            }
+                        }
+                        .padding(.horizontal, 16)
                     }
                 }
-            case "blockquote":
-                let text = blockText(dict)
-                if !text.isEmpty { lines.append("> \(text)") }
-            case "codeBlock":
-                let text = blockText(dict)
-                lines.append("```\n\(text)\n```")
-            case "horizontalRule":
-                lines.append("---")
-            default:
-                let text = blockText(dict)
-                if !text.isEmpty { lines.append(text) }
-            }
-        }
-        let joined = lines.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        return joined.isEmpty ? nil : joined + "\n"
-    }
 
-    private static func blockText(_ node: [String: Any]) -> String {
-        if let type = node["type"] as? String, type == "text" {
-            return node["text"] as? String ?? ""
-        }
-        guard let content = node["content"] as? [Any] else { return "" }
-        return content.compactMap { child -> String? in
-            guard let dict = child as? [String: Any] else { return nil }
-            if dict["type"] as? String == "image" {
-                let attrs = dict["attrs"] as? [String: Any] ?? [:]
-                let src = attrs["src"] as? String ?? ""
-                let alt = attrs["alt"] as? String ?? ""
-                return src.isEmpty ? nil : "![\(alt)](\(src))"
-            }
-            let t = blockText(dict)
-            return t.isEmpty ? nil : t
-        }.joined()
-    }
-
-    private static func inlineMarkdown(_ content: [Any]) -> String {
-        content.compactMap { child -> String? in
-            guard let dict = child as? [String: Any] else { return nil }
-            if dict["type"] as? String == "hardBreak" { return "\n" }
-            if dict["type"] as? String == "text" {
-                var t = dict["text"] as? String ?? ""
-                let marks = dict["marks"] as? [[String: Any]] ?? []
-                // Apply outer marks last so **`code`** style nesting is reasonable.
-                for mark in marks.reversed() {
-                    switch mark["type"] as? String {
-                    case "code":
-                        t = "`\(t)`"
-                    case "bold", "strong":
-                        t = "**\(t)**"
-                    case "italic", "em":
-                        t = "*\(t)*"
-                    case "strike":
-                        t = "~~\(t)~~"
-                    case "link":
-                        let href = (mark["attrs"] as? [String: Any])?["href"] as? String ?? ""
-                        t = "[\(t)](\(href))"
-                    default:
-                        break
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(AppTheme.muted)
+                    TextField(env.preferences.t("搜索或输入新标签", en: "Search or enter a new tag"), text: $query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .onSubmit(createTag)
+                    if !normalizedQuery.isEmpty && !hasExactMatch && selection.count < 24 {
+                        Button(env.preferences.t("新建", en: "Create"), action: createTag)
+                            .font(.system(size: 13, weight: .bold))
                     }
                 }
-                return t
-            }
-            return blockText(dict)
-        }.joined()
-    }
+                .padding(.horizontal, 12)
+                .frame(minHeight: 42)
+                .background(AppTheme.card)
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+                .overlay(RoundedRectangle(cornerRadius: 9).stroke(AppTheme.border, lineWidth: 1))
+                .padding(.horizontal, 16)
 
-    /// Append image node without wiping existing document content.
-    static func appendingImage(toJSON json: String, src: String, alt: String) -> String {
-        if json.contains(src) { return json }
-        guard let data = json.data(using: .utf8),
-              var doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            // Only invent a stub when we truly have no document yet.
-            let safeAlt = alt.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-            return """
-            {"type":"doc","content":[{"type":"paragraph"},{"type":"image","attrs":{"src":"\(src)","alt":"\(safeAlt)"}},{"type":"paragraph"}]}
-            """
-        }
-        var content = doc["content"] as? [[String: Any]] ?? []
-        // Avoid blanking a doc that already has text — only append.
-        content.append([
-            "type": "image",
-            "attrs": ["src": src, "alt": alt] as [String: Any],
-        ])
-        content.append(["type": "paragraph"] as [String: Any])
-        doc["type"] = doc["type"] ?? "doc"
-        doc["content"] = content
-        guard let out = try? JSONSerialization.data(withJSONObject: doc),
-              let s = String(data: out, encoding: .utf8)
-        else { return json }
-        return s
-    }
-}
-
-// MARK: - System PHPicker (reliable; PhotosPicker+Transferable was a silent no-op)
-
-private enum ImagePickerResult {
-    case cancelled
-    case failed(String)
-    case picked(Data, filename: String)
-}
-
-/// UIKit PHPicker wrapper — loads UIImage/data via NSItemProvider (not Transferable).
-private struct SystemImagePicker: UIViewControllerRepresentable {
-    var onFinish: (ImagePickerResult) -> Void
-
-    func makeUIViewController(context: Context) -> PHPickerViewController {
-        var config = PHPickerConfiguration(photoLibrary: .shared())
-        config.filter = .images
-        config.selectionLimit = 1
-        config.preferredAssetRepresentationMode = .current
-        let picker = PHPickerViewController(configuration: config)
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onFinish: onFinish)
-    }
-
-    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
-        let onFinish: (ImagePickerResult) -> Void
-        private var settled = false
-
-        init(onFinish: @escaping (ImagePickerResult) -> Void) {
-            self.onFinish = onFinish
-        }
-
-        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
-            guard !settled else { return }
-            guard let provider = results.first?.itemProvider else {
-                settled = true
-                DispatchQueue.main.async { self.onFinish(.cancelled) }
-                return
-            }
-            Task {
-                do {
-                    let (data, name) = try await Self.loadImage(from: provider)
-                    await MainActor.run {
-                        guard !self.settled else { return }
-                        self.settled = true
-                        self.onFinish(.picked(data, filename: name))
-                    }
-                } catch {
-                    await MainActor.run {
-                        guard !self.settled else { return }
-                        self.settled = true
-                        self.onFinish(.failed(error.localizedDescription))
-                    }
+                if let error {
+                    Text(error).font(.system(size: 13)).foregroundStyle(AppTheme.danger)
                 }
-            }
-        }
 
-        private static func loadImage(from provider: NSItemProvider) async throws -> (Data, String) {
-            // 1) UIImage path — most reliable for Photos library assets.
-            if provider.canLoadObject(ofClass: UIImage.self) {
-                let image = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<UIImage, Error>) in
-                    provider.loadObject(ofClass: UIImage.self) { object, error in
-                        if let image = object as? UIImage {
-                            cont.resume(returning: image)
-                        } else {
-                            cont.resume(
-                                throwing: error
-                                    ?? APIError(status: 0, code: nil, message: "无法解码图片")
-                            )
+                List(visibleTags, id: \.name) { tag in
+                    Button {
+                        toggle(tag.name)
+                    } label: {
+                        HStack {
+                            Image(systemName: selection.contains(tag.name) ? "checkmark.square.fill" : "square")
+                                .foregroundStyle(selection.contains(tag.name) ? AppTheme.accent : AppTheme.muted)
+                            Text("#\(tag.name)").foregroundStyle(AppTheme.title)
+                            Spacer()
+                            Text(env.preferences.t("\(tag.memoCount) 条笔记", en: "\(tag.memoCount) notes"))
+                                .font(.system(size: 12))
+                                .foregroundStyle(AppTheme.muted)
                         }
                     }
+                    .buttonStyle(.plain)
                 }
-                if let data = image.jpegData(compressionQuality: 0.92), !data.isEmpty {
-                    return (data, "image.jpg")
-                }
-            }
-
-            // 2) Typed data representations.
-            let typeIds = [
-                UTType.jpeg.identifier,
-                UTType.png.identifier,
-                UTType.heic.identifier,
-                UTType.image.identifier,
-            ]
-            for typeId in typeIds where provider.hasItemConformingToTypeIdentifier(typeId) {
-                if let data = try? await loadData(provider, typeIdentifier: typeId), !data.isEmpty {
-                    let normalized = ImagePickerData.normalize(data)
-                    let mime = TipTapResourceLoader.sniffImageMime(normalized)
-                    let ext = mime == "image/png" ? "png" : "jpg"
-                    return (normalized, "image.\(ext)")
-                }
-            }
-
-            throw APIError(status: 0, code: nil, message: "无法读取所选图片，请换一张重试。")
-        }
-
-        private static func loadData(_ provider: NSItemProvider, typeIdentifier: String) async throws -> Data {
-            try await withCheckedThrowingContinuation { cont in
-                provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, error in
-                    if let data {
-                        cont.resume(returning: data)
-                    } else {
-                        cont.resume(
-                            throwing: error
-                                ?? APIError(status: 0, code: nil, message: "读取图片数据失败")
+                .listStyle(.plain)
+                .overlay {
+                    if visibleTags.isEmpty {
+                        ContentUnavailableView(
+                            env.preferences.t("暂无匹配标签", en: "No matching tags"),
+                            systemImage: "tag",
+                            description: Text(env.preferences.t("可以输入名称创建新标签。", en: "Enter a name to create a new tag."))
                         )
                     }
                 }
             }
+            .padding(.top, 12)
+            .navigationTitle(env.preferences.t("选择标签", en: "Choose tags"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(env.preferences.t("完成", en: "Done")) { dismiss() }
+                }
+            }
+            .task { loadTags() }
         }
     }
+
+    private func loadTags() {
+        guard let scope = env.session.dataScope else { return }
+        do {
+            availableTags = try env.mirror.listTags(scope: scope)
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func toggle(_ tag: String) {
+        if let index = selection.firstIndex(of: tag) {
+            selection.remove(at: index)
+        } else if selection.count < 24 {
+            selection.append(tag)
+        }
+        onChange(selection)
+    }
+
+    private func createTag() {
+        let additions = normalizedQuery
+            .split(whereSeparator: { $0 == "," || $0 == "，" || $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        for tag in additions where selection.count < 24 && !selection.contains(tag) {
+            selection.append(tag)
+        }
+        query = ""
+        onChange(selection)
+    }
+
 }
 
-enum ImagePickerData {
-    /// HEIC / unknown → JPEG so upload mime is valid and ImageCompressor can decode.
-    static func normalize(_ data: Data) -> Data {
-        if data.starts(with: [0xFF, 0xD8, 0xFF]) { return data } // JPEG
-        if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return data } // PNG
-        if data.starts(with: [0x47, 0x49, 0x46, 0x38]) { return data } // GIF
-        if data.count >= 12 {
-            let riff = data.prefix(4)
-            let webp = data.dropFirst(8).prefix(4)
-            if riff.elementsEqual([0x52, 0x49, 0x46, 0x46]), webp.elementsEqual([0x57, 0x45, 0x42, 0x50]) {
-                return data
-            }
-        }
-        if let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: 0.92) {
-            return jpeg
-        }
-        return data
-    }
-}
 
 // MARK: - Compact notebook picker for create/edit
 
@@ -1439,7 +1484,7 @@ private struct EditNotebookPickerSheet: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
-            .background(Color.white)
+            .background(AppTheme.card)
             .overlay(alignment: .bottom) {
                 Rectangle().fill(AppTheme.border).frame(height: 1)
             }
@@ -1464,6 +1509,6 @@ private struct EditNotebookPickerSheet: View {
             }
             .listStyle(.plain)
         }
-        .background(Color.white)
+        .background(AppTheme.card)
     }
 }

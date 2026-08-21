@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { resolveMemoContentDoc, type MemoDetail, type TiptapDoc } from "@edgeever/shared";
-import { ActivityIndicator, Image as RNImage, Platform, StyleSheet, View, type ImageStyle, type StyleProp } from "react-native";
+import { DEFAULT_MEMO_TITLE, resolveMemoContentDoc, type MemoDetail, type TiptapDoc } from "@edgeever/shared";
+import * as Clipboard from "expo-clipboard";
+import { Image as RNImage, Platform, StyleSheet, Text as RNText, View, type ImageStyle, type StyleProp, type TextStyle } from "react-native";
 import { Modal } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { SvgXml } from "react-native-svg";
-import { ChevronDown, ChevronLeft, ChevronRight, History, MoreHorizontal, Pencil, RotateCcw, Search, Share2, Tag, Trash2, X } from "../components/icons";
+import { ActivityIndicator, ChevronDown, ChevronLeft, ChevronRight, Copy, History, MoreHorizontal, Pencil, RotateCcw, Search, Share2, Sparkles, Tag, Trash2, X } from "../components/icons";
 import { Alert, Pressable, Text, TextInput } from "../components/LocalizedText";
 import LocalTiptapEditor, { type LocalTiptapEditorRef } from "../components/LocalTiptapEditor";
+import { MobileAiAssistantModal } from "../components/MobileAiAssistantModal";
 import { MobileResourceActions } from "../components/MobileResourceActions";
 import { SAFE_DOM_WEBVIEW_PROPS } from "../lib/mobile-dom";
+import { getNextMobileNoteSearchIndex } from "../lib/mobile-note-search";
 import { safeDomCall } from "../lib/safe-dom-call";
 import {
   getMobileImageTarget,
@@ -28,10 +31,10 @@ import { useMobileTheme } from "../lib/mobile-theme";
 import { useSession } from "../lib/session";
 import { beginEditorStartup } from "../lib/startup-performance";
 import type { MobileSyncQueueItem } from "../lib/sync-queue";
+import { getTextSearchMatches } from "./workspace-utils";
 import { styles } from "./workspace-styles";
 
 const ANDROID_SYSTEM_NAVIGATION_FALLBACK = 48;
-const DEFAULT_MEMO_TITLE = "无标题笔记";
 const RESOURCE_DATA_URL_CACHE_LIMIT = 32;
 
 type SessionLike = { baseUrl: string; token: string } | null;
@@ -291,7 +294,48 @@ const DetailActionButton = ({ children, disabled = false, label, onPress }: { ch
   </Pressable>
 );
 
+const HighlightedMetadataText = ({
+  activeIndex,
+  matchOffset,
+  matches,
+  numberOfLines,
+  style,
+  text,
+}: {
+  activeIndex: number;
+  matchOffset: number;
+  matches: Array<{ end: number; start: number }>;
+  numberOfLines?: number;
+  style: StyleProp<TextStyle>;
+  text: string;
+}) => {
+  if (matches.length === 0) {
+    return <RNText numberOfLines={numberOfLines} selectable style={style}>{text}</RNText>;
+  }
+  const content: ReactNode[] = [];
+  let cursor = 0;
+  matches.forEach((match, index) => {
+    if (match.start > cursor) {
+      content.push(text.slice(cursor, match.start));
+    }
+    content.push(
+      <RNText
+        key={`${match.start}-${match.end}`}
+        style={activeIndex === matchOffset + index ? styles.noteSearchHighlightActive : styles.noteSearchHighlight}
+      >
+        {text.slice(match.start, match.end)}
+      </RNText>
+    );
+    cursor = match.end;
+  });
+  if (cursor < text.length) {
+    content.push(text.slice(cursor));
+  }
+  return <RNText numberOfLines={numberOfLines} selectable style={style}>{content}</RNText>;
+};
+
 export const MemoDetailModal = ({
+  initialSearchQuery,
   isDeleting,
   isLoading,
   isRestoring,
@@ -300,6 +344,7 @@ export const MemoDetailModal = ({
   memo,
   notebookName,
   onAdoptCloudVersion,
+  onApplyAiDraft,
   onClose,
   onCopyLocalDraft,
   onDelete,
@@ -315,6 +360,7 @@ export const MemoDetailModal = ({
   syncStatus,
   visible,
 }: {
+  initialSearchQuery: string;
   isDeleting: boolean;
   isLoading: boolean;
   isRestoring: boolean;
@@ -323,6 +369,7 @@ export const MemoDetailModal = ({
   memo: MemoDetail | null;
   notebookName: string;
   onAdoptCloudVersion: (memo: MemoDetail) => void;
+  onApplyAiDraft: (memo: MemoDetail, draft: string, mode: "append" | "replace") => Promise<void>;
   onClose: () => void;
   onCopyLocalDraft: (memo: MemoDetail) => void;
   onDelete: (memo: MemoDetail) => void;
@@ -343,9 +390,10 @@ export const MemoDetailModal = ({
   const { resolvedLocale } = useMobileLocale();
   const safeAreaInsets = useSafeAreaInsets();
   const [actionsOpen, setActionsOpen] = useState(false);
+  const [aiAssistantOpen, setAiAssistantOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchMatchCount, setSearchMatchCount] = useState(0);
+  const [bodySearchMatchCount, setBodySearchMatchCount] = useState(0);
   const [activeMatchIndex, setActiveMatchIndex] = useState(0);
   const [imagePreview, setImagePreview] = useState<{ alt: string; source: string } | null>(null);
   const [resourceTarget, setResourceTarget] = useState<MobileResourceTarget | null>(null);
@@ -425,6 +473,14 @@ export const MemoDetailModal = ({
     }
   }, []);
 
+  const memoTitle = memo?.title?.trim() || DEFAULT_MEMO_TITLE;
+  const memoTagsText = memo?.tags.join(", ") ?? "";
+  const metadataSearchMatches = useMemo(() => ({
+    tags: getTextSearchMatches(memoTagsText, searchQuery),
+    title: getTextSearchMatches(memoTitle, searchQuery),
+  }), [memoTagsText, memoTitle, searchQuery]);
+  const metadataSearchMatchCount = metadataSearchMatches.title.length + metadataSearchMatches.tags.length;
+  const searchMatchCount = metadataSearchMatchCount + bodySearchMatchCount;
   const searchMatchLabel = searchQuery.trim()
     ? `${searchMatchCount > 0 ? activeMatchIndex + 1 : 0}/${searchMatchCount}`
     : "0/0";
@@ -463,33 +519,66 @@ export const MemoDetailModal = ({
   ) + 16;
 
   useEffect(() => {
+    const normalizedInitialSearchQuery = initialSearchQuery.trim();
     setViewerReady(false);
-    setSearchOpen(false);
-    setSearchQuery("");
-    setSearchMatchCount(0);
+    setSearchOpen(Boolean(normalizedInitialSearchQuery));
+    setSearchQuery(normalizedInitialSearchQuery);
+    setBodySearchMatchCount(0);
     setActiveMatchIndex(0);
     setImagePreview(null);
     setResourceTarget(null);
     resourceDataUrlCacheRef.current.clear();
-  }, [memo?.id]);
+  }, [initialSearchQuery, memo?.id]);
 
   useEffect(() => {
     if (!viewerReady || !searchOpen) {
       return;
     }
-    safeDomCall(() => viewerRef.current?.search(searchQuery, activeMatchIndex));
-  }, [activeMatchIndex, searchOpen, searchQuery, viewerReady]);
+    const bodyMatchIndex = activeMatchIndex - metadataSearchMatchCount;
+    const runSearch = () => {
+      safeDomCall(() => viewerRef.current?.search(searchQuery, bodyMatchIndex >= 0 ? bodyMatchIndex : -1));
+    };
+    runSearch();
+    // The first imperative call can land while Android is replacing the DOM
+    // WebView after navigation. Short idempotent retries make that ready race
+    // deterministic; stale callbacks are rejected by their query below.
+    const retryTimers = [120, 360].map((delayMs) => setTimeout(runSearch, delayMs));
+    return () => retryTimers.forEach(clearTimeout);
+  }, [activeMatchIndex, metadataSearchMatchCount, searchOpen, searchQuery, viewerReady]);
+
+  useEffect(() => {
+    setActiveMatchIndex((current) => searchMatchCount > 0
+      ? Math.min(current, searchMatchCount - 1)
+      : 0);
+  }, [searchMatchCount]);
 
   const moveSearchMatch = (direction: 1 | -1) => {
     if (searchMatchCount === 0) {
       return;
     }
-    setActiveMatchIndex((current) => (current + direction + searchMatchCount) % searchMatchCount);
+    setActiveMatchIndex((current) => getNextMobileNoteSearchIndex(current, direction, searchMatchCount));
   };
 
   const closeActionsAndRun = (action: () => void) => {
     setActionsOpen(false);
     action();
+  };
+
+  const canCopyMemoId = Boolean(memo && !memo.id.startsWith("local:") && !memo.id.startsWith("local_"));
+  const copyMemoId = async () => {
+    if (!memo || !canCopyMemoId) return;
+    try {
+      await Clipboard.setStringAsync(memo.id);
+      Alert.alert(
+        resolvedLocale === "en-US" ? "Note ID copied" : "笔记 ID 已复制",
+        memo.id
+      );
+    } catch {
+      Alert.alert(
+        resolvedLocale === "en-US" ? "Could not copy note ID" : "复制笔记 ID 失败",
+        resolvedLocale === "en-US" ? "Please try again." : "请稍后重试。"
+      );
+    }
   };
 
   return (
@@ -556,7 +645,7 @@ export const MemoDetailModal = ({
                 <Search color="#475569" size={20} />
               </Pressable>
             ) : null}
-            {memo?.isDeleted ? (
+            {memo ? (
               <Pressable accessibilityLabel="笔记操作" accessibilityRole="button" onPress={() => setActionsOpen(true)} style={styles.detailHeaderIconButton}>
                 <MoreHorizontal color="#475569" size={21} />
               </Pressable>
@@ -636,7 +725,13 @@ export const MemoDetailModal = ({
         ) : memo ? (
           <View style={detailLayoutStyles.body}>
             <View style={detailLayoutStyles.meta}>
-              <Text selectable style={styles.detailTitle}>{memo.title?.trim() || DEFAULT_MEMO_TITLE}</Text>
+              <HighlightedMetadataText
+                activeIndex={activeMatchIndex}
+                matchOffset={0}
+                matches={metadataSearchMatches.title}
+                style={styles.detailTitle}
+                text={memoTitle}
+              />
               <View style={styles.detailMetaRow}>
                 <View style={styles.detailNotebookButton}>
                   <Text numberOfLines={1} selectable style={styles.detailNotebookName}>{notebookName}</Text>
@@ -644,13 +739,14 @@ export const MemoDetailModal = ({
                 </View>
                 <View style={styles.detailTagsGroup}>
                   <Tag color="#64748b" size={16} />
-                  <Text
+                  <HighlightedMetadataText
+                    activeIndex={activeMatchIndex}
+                    matchOffset={metadataSearchMatches.title.length}
+                    matches={metadataSearchMatches.tags}
                     numberOfLines={1}
-                    selectable
                     style={[styles.detailTagsInline, memo.tags.length === 0 && styles.detailTagsPlaceholder]}
-                  >
-                    {memo.tags.length ? memo.tags.join(", ") : "添加标签，用逗号分隔"}
-                  </Text>
+                    text={memoTagsText || "添加标签，用逗号分隔"}
+                  />
                 </View>
               </View>
               {searchOpen ? (
@@ -663,6 +759,7 @@ export const MemoDetailModal = ({
                       autoCorrect={false}
                       onChangeText={(value) => {
                         setSearchQuery(value);
+                        setBodySearchMatchCount(0);
                         setActiveMatchIndex(0);
                       }}
                       placeholder="在当前笔记内搜索"
@@ -682,9 +779,9 @@ export const MemoDetailModal = ({
                     <DetailActionButton label="关闭搜索" onPress={() => {
                       setSearchOpen(false);
                       setSearchQuery("");
-                      setSearchMatchCount(0);
+                      setBodySearchMatchCount(0);
                       setActiveMatchIndex(0);
-                      safeDomCall(() => viewerRef.current?.search("", 0));
+                      safeDomCall(() => viewerRef.current?.search("", -1));
                     }}>
                       <X color="#0f172a" size={16} />
                     </DetailActionButton>
@@ -717,9 +814,10 @@ export const MemoDetailModal = ({
                   setViewerReady(true);
                 }}
                 onResourcePress={onResourcePress}
-                onSearchResult={async (count, index) => {
-                  setSearchMatchCount(count);
-                  setActiveMatchIndex(count > 0 ? index : 0);
+                onSearchResult={async (count, _index, resultQuery) => {
+                  if (resultQuery === searchQuery) {
+                    setBodySearchMatchCount(count);
+                  }
                 }}
                 ref={viewerRef}
                 theme={resolvedTheme}
@@ -753,22 +851,47 @@ export const MemoDetailModal = ({
             <Pencil color="#ffffff" size={20} />
           </Pressable>
         ) : null}
-        {memo?.isDeleted ? (
+        {memo ? (
           <Modal animationType="fade" onRequestClose={() => setActionsOpen(false)} transparent visible={actionsOpen}>
             <Pressable onPress={() => setActionsOpen(false)} style={styles.actionSheetBackdrop}>
               <Pressable style={styles.actionSheet}>
                 <View style={styles.actionSheetHandle} />
                 <Text style={styles.actionSheetTitle}>笔记操作</Text>
-                <DetailActionSheetItem icon={<Search color="#0f172a" size={18} />} label="搜索当前笔记" onPress={() => closeActionsAndRun(() => {
-                  setSearchOpen(true);
-                })} />
-                <DetailActionSheetItem icon={<History color="#0f172a" size={18} />} label="版本历史" onPress={() => closeActionsAndRun(() => onOpenRevisions(memo))} />
-                <DetailActionSheetItem disabled={isRestoring} icon={<RotateCcw color="#0f172a" size={18} />} label={isRestoring ? "恢复中" : "恢复笔记"} onPress={() => closeActionsAndRun(() => onRestore(memo))} />
-                <View style={styles.listActionDivider} />
-                <DetailActionSheetItem danger disabled={isDeleting} icon={<Trash2 color="#b91c1c" size={18} />} label={isDeleting ? "删除中" : "彻底删除"} onPress={() => closeActionsAndRun(() => onDelete(memo))} />
+                {!memo.isDeleted ? (
+                  <DetailActionSheetItem
+                    icon={<Sparkles color="#16A06E" size={18} />}
+                    label="AI 笔记助手"
+                    onPress={() => closeActionsAndRun(() => setAiAssistantOpen(true))}
+                  />
+                ) : null}
+                <DetailActionSheetItem
+                  disabled={!canCopyMemoId}
+                  icon={<Copy color="#0f172a" size={18} />}
+                  label={canCopyMemoId ? "复制笔记 ID" : "同步后可复制笔记 ID"}
+                  onPress={() => closeActionsAndRun(() => void copyMemoId())}
+                />
+                {memo.isDeleted ? (
+                  <>
+                    <DetailActionSheetItem icon={<Search color="#0f172a" size={18} />} label="搜索当前笔记" onPress={() => closeActionsAndRun(() => {
+                      setSearchOpen(true);
+                    })} />
+                    <DetailActionSheetItem icon={<History color="#0f172a" size={18} />} label="版本历史" onPress={() => closeActionsAndRun(() => onOpenRevisions(memo))} />
+                    <DetailActionSheetItem disabled={isRestoring} icon={<RotateCcw color="#0f172a" size={18} />} label={isRestoring ? "恢复中" : "恢复笔记"} onPress={() => closeActionsAndRun(() => onRestore(memo))} />
+                    <View style={styles.listActionDivider} />
+                    <DetailActionSheetItem danger disabled={isDeleting} icon={<Trash2 color="#b91c1c" size={18} />} label={isDeleting ? "删除中" : "彻底删除"} onPress={() => closeActionsAndRun(() => onDelete(memo))} />
+                  </>
+                ) : null}
               </Pressable>
             </Pressable>
           </Modal>
+        ) : null}
+        {memo && !memo.isDeleted ? (
+          <MobileAiAssistantModal
+            memo={memo}
+            onApply={(draft, mode) => onApplyAiDraft(memo, draft, mode)}
+            onClose={() => setAiAssistantOpen(false)}
+            visible={aiAssistantOpen}
+          />
         ) : null}
         <Modal animationType="fade" onRequestClose={() => setImagePreview(null)} transparent visible={Boolean(imagePreview)}>
           <View style={resourceImageStyles.previewBackdrop}>

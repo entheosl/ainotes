@@ -3,6 +3,56 @@ import XCTest
 @testable import EdgeEver
 
 final class TipTapContentSourceTests: XCTestCase {
+    func testEditorMarkdownRemainsAuthoritativeForRichStructures() {
+        let markdown = """
+        1. first
+           1. nested
+
+        ```swift
+        let value = 1
+        ```
+        """
+        let json = """
+        {"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"first"}]}]}]},{"type":"codeBlock","attrs":{"language":"swift"},"content":[{"type":"text","text":"let value = 1"}]}]}
+        """
+
+        XCTAssertEqual(
+            EditorContentCodec.preferredMarkdown(
+                editorMarkdown: markdown,
+                documentJSON: json,
+                fallback: ""
+            ),
+            markdown
+        )
+    }
+
+    func testEditorMarkdownFallbackDoesNotReplaceExistingCompatibilityCopy() {
+        let fallback = "| A | B |\n| --- | --- |\n| 1 | 2 |\n"
+        let json = """
+        {"type":"doc","content":[{"type":"table","content":[]}]}
+        """
+
+        XCTAssertEqual(
+            EditorContentCodec.preferredMarkdown(
+                editorMarkdown: nil,
+                documentJSON: json,
+                fallback: fallback
+            ),
+            fallback
+        )
+    }
+
+    func testEmptyEditorMarkdownRemainsAuthoritative() {
+        XCTAssertEqual(
+            EditorContentCodec.preferredMarkdown(
+                editorMarkdown: "",
+                documentJSON: #"{"type":"doc","content":[]}"#,
+                fallback: "previous content"
+            ),
+            ""
+        )
+    }
+
     /// Flattened JSON + rich markdown must NOT drive the detail viewer (regression).
     func testViewerAlwaysPrefersMarkdownWhenPresent() {
         let richMD = """
@@ -57,6 +107,32 @@ final class TipTapContentSourceTests: XCTestCase {
         let d = TipTapContentSource.resolve(mode: .editor, documentJSON: json, markdown: md)
         // Image node in JSON scores structure; simple md shouldn't force markdown path.
         XCTAssertTrue(d.useJSON, "simple image+text notes should keep JSON for order fidelity")
+    }
+
+    func testEditorAndViewerRecoverMathMissingFromLegacyJSON() {
+        let markdown = "Euler: $e^{i\\pi}+1=0$."
+        let flatJSON = #"{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Euler: $e^{i\\pi}+1=0$."}]}]}"#
+
+        XCTAssertFalse(TipTapContentSource.resolve(mode: .editor, documentJSON: flatJSON, markdown: markdown).useJSON)
+        XCTAssertFalse(TipTapContentSource.resolve(mode: .viewer, documentJSON: flatJSON, markdown: markdown).useJSON)
+    }
+
+    func testEditorRecoversTaskListMissingFromLegacyJSON() {
+        let markdown = "- [ ] Pending\n- [x] Complete\n"
+        let legacyJSON = #"{"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Pending"}]}]}]}]}"#
+
+        let decision = TipTapContentSource.resolve(mode: .editor, documentJSON: legacyJSON, markdown: markdown)
+        XCTAssertFalse(decision.useJSON)
+        XCTAssertEqual(decision.payload, markdown)
+    }
+
+    func testNativeMarkdownFallbackPreservesTaskState() {
+        let json = #"{"type":"doc","content":[{"type":"taskList","content":[{"type":"taskItem","attrs":{"checked":false},"content":[{"type":"paragraph","content":[{"type":"text","text":"Pending"}]}]},{"type":"taskItem","attrs":{"checked":true},"content":[{"type":"paragraph","content":[{"type":"text","text":"Complete"}]}]}]}]}"#
+
+        XCTAssertEqual(
+            EditorContentCodec.markdownFromTipTapJSON(json),
+            "- [ ] Pending\n\n- [x] Complete\n"
+        )
     }
 
     /// Live WKWebView: packaged TipTap must turn Markdown into real DOM structure.
@@ -119,6 +195,12 @@ final class TipTapContentSourceTests: XCTestCase {
         ```js
         console.log(1)
         ```
+
+        Euler: $e^{i\\pi}+1=0$.
+
+        $$
+        \\frac{a}{b}
+        $$
         """
         let b64 = Data(sample.utf8).base64EncodedString()
         _ = try await eval(webView, """
@@ -139,6 +221,7 @@ final class TipTapContentSourceTests: XCTestCase {
         let strong = try await evalInt(webView, "document.querySelectorAll('strong,b').length")
         let li = try await evalInt(webView, "document.querySelectorAll('li').length")
         let pre = try await evalInt(webView, "document.querySelectorAll('pre').length")
+        let math = try await evalInt(webView, "document.querySelectorAll('.tiptap-mathematics-render .katex').length")
         let rawLeak = try await evalBool(
             webView,
             "document.body.innerText.indexOf('## 标题渲染') >= 0 && document.querySelectorAll('h1,h2,h3').length === 0"
@@ -148,6 +231,7 @@ final class TipTapContentSourceTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(strong, 1, "bold markdown must render as strong/b")
         XCTAssertGreaterThanOrEqual(li, 2, "list items must render")
         XCTAssertGreaterThanOrEqual(pre, 1, "fenced code must render as pre")
+        XCTAssertEqual(math, 2, "inline and block LaTeX must render through KaTeX")
         XCTAssertFalse(rawLeak, "must not show raw '## heading' as plain text without heading nodes")
 
         // Contrast: flattened JSON path must NOT be what viewer policy selects.
